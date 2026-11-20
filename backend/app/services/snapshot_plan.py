@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.services.pipeline import SnapshotRetentionManager
 from app.store import store
 
 VALID_CYCLES = {"每分钟", "每小时", "每次变更", "每日", "每周", "每月", "每季度"}
@@ -106,6 +107,13 @@ class SnapshotPlanService(BaseModuleService):
             # 创建初始快照
             cycle = entry.get("快照周期", "每日")
             initial_snap = _create_initial_snapshot(entry)
+            # 把初始分区登记进快照保留记录，纳入按目标表+快照编号的留存核算
+            manager = SnapshotRetentionManager(store)
+            partition = _current_partition(entry.get("分区格式", "ds=yyyyMMdd"))
+            manager.register_partition(
+                target_table, partition, rows=[],
+                version_label="v1.0", entry_id=entry_id, snap_id=initial_snap,
+            )
             store.channel.publish("snapshot.enabled", {
                 "strategy_name": entry["策略名称"],
                 "target_table": target_table,
@@ -151,6 +159,9 @@ class SnapshotPlanService(BaseModuleService):
         # 自动快照统计
         snapshot_info = store.snapshot.snapshot_summary()
         base["auto_snapshots"] = snapshot_info.get("total_snapshots", 0)
+
+        # 快照留存核算：释放的分区与仍可回退的版本
+        base["retention"] = store.retention.summary()
         return base
 
 
@@ -184,3 +195,19 @@ def _create_initial_snapshot(entry: dict[str, Any]) -> str:
         "init"
     )
     return snap_id
+
+
+def _current_partition(partition_fmt: str) -> str:
+    """按分区格式生成当前周期的分区标识。"""
+    now = datetime.now(timezone.utc)
+    if partition_fmt.startswith("hour="):
+        return now.strftime("hour=%Y%m%d%H")
+    if partition_fmt.startswith("week="):
+        return now.strftime("week=%Y%W")
+    if partition_fmt.startswith("month="):
+        return now.strftime("month=%Y%m")
+    if partition_fmt.startswith("year="):
+        return now.strftime("year=%Y")
+    if partition_fmt.startswith("version="):
+        return now.strftime("version=%Y%m%d%H%M%S")
+    return now.strftime("ds=%Y%m%d")

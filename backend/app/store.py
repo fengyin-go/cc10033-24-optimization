@@ -165,12 +165,17 @@ class FailureRecovery:
         }
 
 
+class SnapshotReadError(RuntimeError):
+    """快照读取异常：快照不存在、已被清理释放或当前不可读。"""
+
+
 class SnapshotEngine:
     """版本快照引擎：创建、比较和管理数据快照。"""
 
     def __init__(self) -> None:
         self._snapshots: dict[str, dict[str, Any]] = {}
         self._diff_logs: dict[str, dict[str, Any]] = {}
+        self._unreadable: set[str] = set()
 
     def create_snapshot(self, module: str, entry_id: int, data: dict[str, Any], version_label: str = "") -> str:
         """创建数据快照，返回快照ID。"""
@@ -211,6 +216,31 @@ class SnapshotEngine:
 
     def get_snapshot(self, snap_id: str) -> dict[str, Any] | None:
         return self._snapshots.get(snap_id)
+
+    def mark_unreadable(self, snap_id: str) -> None:
+        """把快照标记为不可读，用于模拟存储侧读取异常。"""
+        self._unreadable.add(snap_id)
+
+    def clear_unreadable(self, snap_id: str) -> None:
+        """解除快照的不可读标记，模拟读取异常恢复。"""
+        self._unreadable.discard(snap_id)
+
+    def read_snapshot(self, snap_id: str) -> dict[str, Any]:
+        """严格读取快照：不存在或不可读时抛出 SnapshotReadError。"""
+        if snap_id in self._unreadable:
+            raise SnapshotReadError(f"快照 {snap_id} 读取异常：当前不可读")
+        snap = self._snapshots.get(snap_id)
+        if snap is None:
+            raise SnapshotReadError(f"快照 {snap_id} 不存在或已释放")
+        return snap
+
+    def is_readable(self, snap_id: str) -> bool:
+        """快照当前是否可读（存在且未被标记不可读）。"""
+        try:
+            self.read_snapshot(snap_id)
+            return True
+        except SnapshotReadError:
+            return False
 
     def list_snapshots(self, module: str, entry_id: int) -> list[dict[str, Any]]:
         return [
@@ -264,6 +294,236 @@ class SnapshotEngine:
         for s in self._snapshots.values():
             by_module[s["module"]] = by_module.get(s["module"], 0) + 1
         return {"total_snapshots": len(self._snapshots), "by_module": by_module, "total_diffs": len(self._diff_logs)}
+
+
+TERMINAL_TASK_STATES = {"rolled_back", "cancelled"}
+
+
+def _partition_date(partition: str) -> str:
+    """从分区标识中提取日期部分，如 ds=20261031 -> 20261031。"""
+    text = str(partition)
+    if "=" in text:
+        text = text.split("=", 1)[1]
+    digits = "".join(ch for ch in text if ch.isdigit())
+    return digits or str(partition)
+
+
+class SnapshotRetentionLedger:
+    """快照保留记录：按目标表与快照编号核算留存。
+
+    - 每条记录对应一个日期分区的一版快照，状态在
+      active（仍可回退）/ released（已释放）/ rolled_back（已回退）间流转
+    - 清理把实际释放的快照编号记入记录，回滚把实际引用的编号记入记录
+    - 回滚任务登记在册，清理释放前据此核对有效引用
+    """
+
+    RECORD_STATES = ("active", "released", "rolled_back")
+    # 仍占用留存份额、仍可作为回滚来源的状态（已释放除外）
+    RETAINED_STATES = ("active", "rolled_back")
+
+    def __init__(self) -> None:
+        self._records: dict[str, dict[str, Any]] = {}
+        self._record_seq = 0
+        self._snap_seq: dict[str, int] = {}
+        self._cleanup_log: list[dict[str, Any]] = []
+        self._cleanup_seq = 0
+        self._rollback_tasks: dict[str, dict[str, Any]] = {}
+        self._task_seq = 0
+
+    # ------------------------------------------------------------------
+    # 留存记录
+    # ------------------------------------------------------------------
+    def next_snapshot_no(self, target_table: str) -> str:
+        """按目标表递增分配快照编号。"""
+        seq = self._snap_seq.get(target_table, 0) + 1
+        self._snap_seq[target_table] = seq
+        return f"SNAP-{seq:04d}"
+
+    def register(self, *, target_table: str, snapshot_no: str, partition: str,
+                 snap_id: str, version_label: str = "", compat_group: str = "") -> dict[str, Any]:
+        """登记一条快照保留记录，初始状态为 active（仍可回退）。"""
+        self._record_seq += 1
+        record_id = f"RET-{self._record_seq:06d}"
+        record = {
+            "record_id": record_id,
+            "target_table": target_table,
+            "snapshot_no": snapshot_no,
+            "partition": partition,
+            "partition_date": _partition_date(partition),
+            "snap_id": snap_id,
+            "version_label": version_label,
+            "compat_group": compat_group or version_label,
+            "state": "active",
+            "registered_at": datetime.now(timezone.utc).isoformat(),
+            "released_at": None,
+            "released_by": None,
+            "rolled_back_at": None,
+            "used_by_rollback": None,
+            "used_snapshot_no": None,
+            "rollback_refs": [],
+            "seq": self._record_seq,
+        }
+        self._records[record_id] = record
+        return record
+
+    def get(self, record_id: str) -> dict[str, Any] | None:
+        return self._records.get(record_id)
+
+    def for_table(self, target_table: str, states: set[str] | None = None) -> list[dict[str, Any]]:
+        """按快照编号顺序返回目标表的留存记录。"""
+        records = [r for r in self._records.values() if r["target_table"] == target_table]
+        if states:
+            records = [r for r in records if r["state"] in states]
+        return sorted(records, key=lambda r: r["seq"])
+
+    def find_by_snapshot_no(self, target_table: str, snapshot_no: str) -> dict[str, Any] | None:
+        for record in self.for_table(target_table):
+            if record["snapshot_no"] == snapshot_no:
+                return record
+        return None
+
+    def find_by_partition(self, target_table: str, partition: str) -> dict[str, Any] | None:
+        """返回目标表指定分区最新登记的一条留存记录。"""
+        matches = [r for r in self.for_table(target_table) if r["partition"] == partition]
+        return matches[-1] if matches else None
+
+    def mark_released(self, record_id: str, released_by: str) -> dict[str, Any] | None:
+        record = self._records.get(record_id)
+        if record is None:
+            return None
+        record["state"] = "released"
+        record["released_at"] = datetime.now(timezone.utc).isoformat()
+        record["released_by"] = released_by
+        return record
+
+    def mark_rolled_back(self, record_id: str, *, task_id: str, used_snapshot_no: str) -> dict[str, Any] | None:
+        record = self._records.get(record_id)
+        if record is None:
+            return None
+        record["state"] = "rolled_back"
+        record["rolled_back_at"] = datetime.now(timezone.utc).isoformat()
+        record["used_by_rollback"] = task_id
+        record["used_snapshot_no"] = used_snapshot_no
+        return record
+
+    def add_rollback_ref(self, record_id: str, task_id: str) -> bool:
+        record = self._records.get(record_id)
+        if record is None:
+            return False
+        if task_id not in record["rollback_refs"]:
+            record["rollback_refs"].append(task_id)
+        return True
+
+    # ------------------------------------------------------------------
+    # 回滚任务
+    # ------------------------------------------------------------------
+    def create_rollback_task(self, target_table: str, partition: str,
+                             task_id: str | None = None) -> dict[str, Any]:
+        self._task_seq += 1
+        task_id = task_id or f"RB-{self._task_seq:04d}"
+        task = {
+            "task_id": task_id,
+            "target_table": target_table,
+            "partition": partition,
+            "status": "pending",
+            "planned_snapshot_no": None,
+            "used_snapshot_no": None,
+            "attempts": 0,
+            "last_error": None,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "updated_at": None,
+        }
+        self._rollback_tasks[task_id] = task
+        return task
+
+    def get_task(self, task_id: str) -> dict[str, Any] | None:
+        return self._rollback_tasks.get(task_id)
+
+    def update_task(self, task_id: str, **fields: Any) -> dict[str, Any] | None:
+        task = self._rollback_tasks.get(task_id)
+        if task is None:
+            return None
+        task.update(fields)
+        task["updated_at"] = datetime.now(timezone.utc).isoformat()
+        return task
+
+    def tasks_for(self, target_table: str | None = None,
+                  statuses: set[str] | None = None) -> list[dict[str, Any]]:
+        tasks = list(self._rollback_tasks.values())
+        if target_table:
+            tasks = [t for t in tasks if t["target_table"] == target_table]
+        if statuses:
+            tasks = [t for t in tasks if t["status"] in statuses]
+        return tasks
+
+    def valid_rollback_refs(self, record: dict[str, Any]) -> list[dict[str, Any]]:
+        """记录上的有效回滚引用：未终结任务显式引用或指向同一分区。"""
+        refs: list[dict[str, Any]] = []
+        for task in self._rollback_tasks.values():
+            if task["status"] in TERMINAL_TASK_STATES:
+                continue
+            if task["task_id"] in record["rollback_refs"]:
+                refs.append(task)
+            elif (task["target_table"] == record["target_table"]
+                  and task["partition"] == record["partition"]):
+                refs.append(task)
+        return refs
+
+    def pending_rollback_partitions(self, target_table: str | None = None) -> list[str]:
+        """仍待回退的分区：存在未终结回滚任务的分区。"""
+        parts = {
+            task["partition"]
+            for task in self._rollback_tasks.values()
+            if task["status"] not in TERMINAL_TASK_STATES
+            and (target_table is None or task["target_table"] == target_table)
+        }
+        return sorted(parts)
+
+    # ------------------------------------------------------------------
+    # 清理日志与汇总
+    # ------------------------------------------------------------------
+    def log_cleanup(self, *, target_table: str, task_id: str,
+                    released: list[dict[str, Any]],
+                    skipped_referenced: list[dict[str, Any]],
+                    kept_snapshot_nos: list[str]) -> dict[str, Any]:
+        """记录一次清理实际释放的快照编号与分区。"""
+        self._cleanup_seq += 1
+        entry = {
+            "run_id": f"CLN-{self._cleanup_seq:04d}",
+            "target_table": target_table,
+            "task_id": task_id,
+            "released_snapshot_nos": [r["snapshot_no"] for r in released],
+            "released_partitions": [r["partition"] for r in released],
+            "skipped_referenced": skipped_referenced,
+            "kept_snapshot_nos": list(kept_snapshot_nos),
+            "ran_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self._cleanup_log.append(entry)
+        return entry
+
+    def cleanup_history(self, target_table: str | None = None) -> list[dict[str, Any]]:
+        if target_table is None:
+            return list(self._cleanup_log)
+        return [e for e in self._cleanup_log if e["target_table"] == target_table]
+
+    def summary(self, target_table: str | None = None) -> dict[str, Any]:
+        records = [
+            r for r in self._records.values()
+            if target_table is None or r["target_table"] == target_table
+        ]
+        by_state: dict[str, list[str]] = {}
+        for record in records:
+            by_state.setdefault(record["state"], []).append(record["snapshot_no"])
+        return {
+            "total": len(records),
+            "by_state": by_state,
+            "released_partitions": sorted(
+                r["partition"] for r in records if r["state"] == "released"
+            ),
+            "rollback_tasks": len(self._rollback_tasks),
+            "cleanup_runs": len(self._cleanup_log),
+            "pending_rollback": self.pending_rollback_partitions(target_table),
+        }
 
 
 class ArtifactRegistry:
@@ -324,6 +584,7 @@ class Store:
         self.channel = DataChannel()
         self.recovery = FailureRecovery()
         self.snapshot = SnapshotEngine()
+        self.retention = SnapshotRetentionLedger()
         self.artifacts = ArtifactRegistry()
 
     def module_names(self) -> list[str]:
@@ -361,6 +622,7 @@ class Store:
         recovery = self.recovery.recovery_summary()
         snapshot_info = self.snapshot.snapshot_summary()
         artifact_info = self.artifacts.artifact_summary()
+        retention_info = self.retention.summary()
         return {
             "cards": cards,
             "modules": modules,
@@ -368,6 +630,7 @@ class Store:
             "recovery": recovery,
             "snapshots": snapshot_info,
             "artifacts": artifact_info,
+            "retention": retention_info,
         }
 
 

@@ -7,12 +7,15 @@
   conform_dim → dim_definition 关联约束
   snapshot_plan → data_vault → model_lineage
   date_dim_gen → fact_design 外键关联
+  snapshot_plan 留存清理 ↔ 回滚协调（SnapshotRetentionManager）
 """
 from __future__ import annotations
 
 import time
 import uuid
 from typing import Any, Optional
+
+from app.store import SnapshotReadError
 
 # ---------------------------------------------------------------------------
 # 1. SCD 类型 2 处理
@@ -497,3 +500,317 @@ def date_dim_to_fact_fk(
         "linked_facts": len(target_facts),
         "available_date_keys": len(date_keys),
     }
+
+
+# ---------------------------------------------------------------------------
+# 8. 快照留存清理与回滚协调
+# ---------------------------------------------------------------------------
+
+
+class SnapshotRetentionManager:
+    """快照留存与回滚协调器：解决过期清理与回滚并发冲突。
+
+    - 留存按 (目标表, 快照编号) 核算：清理只释放核算出的超量编号，
+      不按日期范围删除，按策略重复清理也不会误删相邻日期的新分区
+    - 分区超出留存周期也须先核对回滚任务的有效引用，被引用分区本轮跳过
+    - 回滚读取目标表关联的快照保留记录判定回写资格；
+      自有快照已释放时，回退到同一目标表仍存的兼容快照
+    - 清理留下实际释放的编号，回滚留下实际引用的编号；
+      回滚确认后实际使用的快照编号与分区必须还能查到，且快照可读
+    """
+
+    def __init__(self, store: Any) -> None:
+        self._store = store
+
+    # ------------------------------------------------------------------
+    # 登记快照分区
+    # ------------------------------------------------------------------
+    def register_partition(
+        self,
+        target_table: str,
+        partition: str,
+        rows: list[dict[str, Any]] | None = None,
+        *,
+        version_label: str = "v1.0",
+        compat_group: str | None = None,
+        module: str = "snapshot_plan",
+        entry_id: int = 0,
+        snap_id: str | None = None,
+    ) -> dict[str, Any]:
+        """登记快照分区：创建引擎快照并写入快照保留记录，返回留存记录。"""
+        ledger = self._store.retention
+        snapshot_no = ledger.next_snapshot_no(target_table)
+        if snap_id is None:
+            snap_id = self._store.snapshot.create_snapshot(module, entry_id, {
+                "target_table": target_table,
+                "partition": partition,
+                "snapshot_no": snapshot_no,
+                "rows": [dict(r) for r in (rows or [])],
+            }, version_label)
+        record = ledger.register(
+            target_table=target_table,
+            snapshot_no=snapshot_no,
+            partition=partition,
+            snap_id=snap_id,
+            version_label=version_label,
+            compat_group=compat_group or version_label,
+        )
+        self._store.channel.publish("snapshot.partition_registered", {
+            "target_table": target_table,
+            "partition": partition,
+            "snapshot_no": snapshot_no,
+            "record_id": record["record_id"],
+        })
+        return record
+
+    # ------------------------------------------------------------------
+    # 过期清理：按保留份数核算释放
+    # ------------------------------------------------------------------
+    def cleanup_expired(
+        self,
+        target_table: str,
+        retention_count: int | str,
+        task_id: str | None = None,
+    ) -> dict[str, Any]:
+        """按保留份数清理目标表超量的旧分区。
+
+        只按快照编号顺序核算超量的现存 active 记录并逐条释放：
+        已释放记录不会重复释放，后登记的新分区（包括相邻日期的回填分区）
+        编号更新，不会被按日期范围误删。释放前先核对回滚任务有效引用。
+        """
+        ledger = self._store.retention
+        run_task = task_id or "cleanup"
+        try:
+            keep = max(0, int(retention_count))
+        except (TypeError, ValueError):
+            keep = 0
+
+        retained = ledger.for_table(target_table, states=set(ledger.RETAINED_STATES))
+        excess = max(0, len(retained) - keep)
+        candidates = retained[:excess]  # 最旧的快照编号先进入清理范围
+
+        released: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
+        for record in candidates:
+            refs = ledger.valid_rollback_refs(record)
+            if refs:
+                skipped.append({
+                    "snapshot_no": record["snapshot_no"],
+                    "partition": record["partition"],
+                    "refs": [t["task_id"] for t in refs],
+                })
+                continue
+            ledger.mark_released(record["record_id"], released_by=run_task)
+            released.append(record)
+
+        kept = [r["snapshot_no"] for r in ledger.for_table(
+            target_table, states=set(ledger.RETAINED_STATES))]
+        run = ledger.log_cleanup(
+            target_table=target_table,
+            task_id=run_task,
+            released=released,
+            skipped_referenced=skipped,
+            kept_snapshot_nos=kept,
+        )
+        self._store.channel.publish("snapshot.cleanup_done", {
+            "target_table": target_table,
+            "run_id": run["run_id"],
+            "released_snapshot_nos": run["released_snapshot_nos"],
+            "skipped": len(skipped),
+        })
+        return {
+            "run_id": run["run_id"],
+            "target_table": target_table,
+            "released_snapshot_nos": run["released_snapshot_nos"],
+            "released_partitions": run["released_partitions"],
+            "skipped_referenced": skipped,
+            "kept_snapshot_nos": kept,
+        }
+
+    # ------------------------------------------------------------------
+    # 回滚：请求校验与确认回写
+    # ------------------------------------------------------------------
+    def request_rollback(
+        self,
+        target_table: str,
+        partition: str,
+        task_id: str | None = None,
+    ) -> dict[str, Any]:
+        """回滚请求校验：读取目标表关联的快照保留记录，判定回写资格。
+
+        有资格则登记任务对快照编号的引用（供清理核对），
+        无可用版本则任务阻塞、分区维持待回退。
+        """
+        ledger = self._store.retention
+        task = ledger.create_rollback_task(target_table, partition, task_id=task_id)
+        record = ledger.find_by_partition(target_table, partition)
+        resolution = self._resolve_snapshot(record, target_table)
+        if resolution is None:
+            ledger.update_task(
+                task["task_id"], status="blocked", attempts=1,
+                last_error="无可用快照版本",
+            )
+            self._store.recovery.log_retry(
+                "snapshot_plan", task["task_id"], 1, "无可用快照版本", False)
+        else:
+            used_rec, snap_no = resolution
+            ledger.add_rollback_ref(used_rec["record_id"], task["task_id"])
+            if record is not None and record["record_id"] != used_rec["record_id"]:
+                ledger.add_rollback_ref(record["record_id"], task["task_id"])
+            ledger.update_task(
+                task["task_id"], status="eligible", attempts=1,
+                planned_snapshot_no=snap_no,
+            )
+        return dict(ledger.get_task(task["task_id"]))
+
+    def confirm_rollback(self, task_id: str) -> dict[str, Any]:
+        """回滚确认：校验实际使用的快照编号与分区仍可查到且快照可读，然后回写分区。
+
+        校验失败时任务阻塞、分区维持待回退，可修复后重试。
+        """
+        ledger = self._store.retention
+        task = ledger.get_task(task_id)
+        if task is None:
+            return {"ok": False, "status": "missing_task",
+                    "message": f"回滚任务 {task_id} 不存在"}
+        if task["status"] == "rolled_back":
+            return {"ok": True, "status": "rolled_back", "task_id": task_id,
+                    "used_snapshot_no": task["used_snapshot_no"],
+                    "partition": task["partition"], "idempotent": True}
+
+        target_table = task["target_table"]
+        partition = task["partition"]
+        record = ledger.find_by_partition(target_table, partition)
+        resolution = self._resolve_snapshot(
+            record, target_table,
+            prefer_snapshot_no=task.get("planned_snapshot_no"),
+        )
+        if resolution is None:
+            return self._block_task(task, "无可用快照版本或快照不可读")
+
+        used_rec, snap_no = resolution
+        try:
+            snap = self._store.snapshot.read_snapshot(used_rec["snap_id"])
+        except SnapshotReadError as exc:
+            return self._block_task(task, str(exc))
+
+        rows = [dict(r) for r in snap["data"].get("rows", [])]
+        written = self._write_back_partition(target_table, partition, rows)
+
+        # 留痕：回滚实际引用的快照编号
+        ledger.add_rollback_ref(used_rec["record_id"], task_id)
+        if record is not None and record["record_id"] != used_rec["record_id"]:
+            ledger.add_rollback_ref(record["record_id"], task_id)
+            ledger.mark_rolled_back(
+                record["record_id"], task_id=task_id, used_snapshot_no=snap_no)
+        elif record is not None:
+            ledger.mark_rolled_back(
+                record["record_id"], task_id=task_id, used_snapshot_no=snap_no)
+        ledger.update_task(
+            task_id, status="rolled_back", attempts=task["attempts"] + 1,
+            used_snapshot_no=snap_no, last_error=None,
+        )
+        self._store.recovery.log_retry(
+            "snapshot_plan", task_id, task["attempts"] + 1, "回滚确认", True)
+        self._store.channel.publish("snapshot.rollback_confirmed", {
+            "target_table": target_table,
+            "partition": partition,
+            "used_snapshot_no": snap_no,
+            "task_id": task_id,
+        })
+        return {
+            "ok": True,
+            "status": "rolled_back",
+            "task_id": task_id,
+            "used_snapshot_no": snap_no,
+            "partition": partition,
+            "written_rows": written,
+        }
+
+    # ------------------------------------------------------------------
+    # 查询
+    # ------------------------------------------------------------------
+    def retention_records(self, target_table: str) -> list[dict[str, Any]]:
+        """目标表关联的全部快照保留记录（按快照编号顺序）。"""
+        return self._store.retention.for_table(target_table)
+
+    def pending_rollback_partitions(self, target_table: str | None = None) -> list[str]:
+        """仍待回退的分区（存在未终结回滚任务）。"""
+        return self._store.retention.pending_rollback_partitions(target_table)
+
+    def rollback_task(self, task_id: str) -> dict[str, Any] | None:
+        return self._store.retention.get_task(task_id)
+
+    def cleanup_history(self, target_table: str | None = None) -> list[dict[str, Any]]:
+        return self._store.retention.cleanup_history(target_table)
+
+    # ------------------------------------------------------------------
+    # 内部
+    # ------------------------------------------------------------------
+    def _resolve_snapshot(
+        self,
+        record: dict[str, Any] | None,
+        target_table: str,
+        prefer_snapshot_no: str | None = None,
+    ) -> tuple[dict[str, Any], str] | None:
+        """判定回写资格并选定实际使用的快照编号。
+
+        顺序：请求阶段已计划的编号 → 分区自有仍可回退版本 → 同表兼容快照。
+        分区从未登记（缺失）时不予回写，维持待回退。
+        """
+        ledger = self._store.retention
+        if record is None:
+            return None
+        retained = set(ledger.RETAINED_STATES)
+        if prefer_snapshot_no:
+            preferred = ledger.find_by_snapshot_no(target_table, prefer_snapshot_no)
+            if (preferred is not None and preferred["state"] in retained
+                    and self._store.snapshot.is_readable(preferred["snap_id"])):
+                return preferred, preferred["snapshot_no"]
+        if record["state"] in retained and self._store.snapshot.is_readable(record["snap_id"]):
+            return record, record["snapshot_no"]
+        compat_group = record.get("compat_group")
+        for cand in ledger.for_table(target_table, states=retained):
+            if cand["record_id"] == record["record_id"]:
+                continue
+            if compat_group and cand.get("compat_group") != compat_group:
+                continue
+            if self._store.snapshot.is_readable(cand["snap_id"]):
+                return cand, cand["snapshot_no"]
+        return None
+
+    def _block_task(self, task: dict[str, Any], reason: str) -> dict[str, Any]:
+        """回滚受阻：任务阻塞并记录重试，分区维持待回退。"""
+        ledger = self._store.retention
+        attempts = task["attempts"] + 1
+        ledger.update_task(
+            task["task_id"], status="blocked", attempts=attempts, last_error=reason)
+        self._store.recovery.log_retry(
+            "snapshot_plan", task["task_id"], attempts, reason, False)
+        return {
+            "ok": False,
+            "status": "pending_rollback",
+            "task_id": task["task_id"],
+            "partition": task["partition"],
+            "reason": reason,
+            "pending_rollback_partitions": ledger.pending_rollback_partitions(
+                task["target_table"]),
+        }
+
+    def _write_back_partition(
+        self,
+        target_table: str,
+        partition: str,
+        rows: list[dict[str, Any]],
+    ) -> int:
+        """把快照中的行回写到目标表的指定分区。"""
+        table = self._store.rows(target_table)
+        kept = [r for r in table if r.get("partition") != partition]
+        now_str = time.strftime("%Y-%m-%d %H:%M:%S")
+        for row in rows:
+            restored = dict(row)
+            restored["partition"] = partition
+            restored["_rolled_back_at"] = now_str
+            kept.append(restored)
+        table[:] = kept
+        return len(rows)
